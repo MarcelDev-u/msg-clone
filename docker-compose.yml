@@ -8,6 +8,20 @@ services:
       CHAT_DB_PATH: /data/chat.db
     volumes:
       - chat-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 128m
+    cpus: "0.50"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   chat-data:
