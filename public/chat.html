@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chat Room</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --border: #d7dbe3;
+      --mine: #d7f0ff;
+      --other: #f0f2f7;
+      --system: #fff8d8;
+      --text: #1a1d24;
+      --muted: #5d6576;
+    }
+
+    body {
+      font-family: sans-serif;
+      max-width: 860px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    #messages {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      min-height: 320px;
+      max-height: 62vh;
+      padding: 1rem;
+      overflow-y: auto;
+      background: var(--panel);
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+
+    .row {
+      display: flex;
+      width: 100%;
+    }
+
+    .row.mine {
+      justify-content: flex-end;
+    }
+
+    .row.other {
+      justify-content: flex-start;
+    }
+
+    .row.system {
+      justify-content: center;
+    }
+
+    .bubble {
+      border-radius: 14px;
+      padding: 0.55rem 0.75rem;
+      max-width: 78%;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+      border: 1px solid var(--border);
+    }
+
+    .row.mine .bubble {
+      background: var(--mine);
+    }
+
+    .row.other .bubble {
+      background: var(--other);
+    }
+
+    .row.system .bubble {
+      background: var(--system);
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+
+    .sender {
+      display: block;
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 0.2rem;
+    }
+
+    #composer { margin-top: 1rem; display: flex; gap: 0.5rem; }
+    #text { flex: 1; padding: 0.7rem; border: 1px solid var(--border); border-radius: 8px; }
+    button { padding: 0.7rem 1rem; border: 1px solid var(--border); border-radius: 8px; background: #eef2ff; }
+    .meta { color: #555; font-size: 0.9rem; margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Shared Chat</h1>
+  <div class="meta" id="meta"></div>
+  <div id="messages"></div>
+
+  <form id="composer">
+    <input id="text" autocomplete="off" placeholder="Write a message" maxlength="500" />
+    <button type="submit">Send</button>
+  </form>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const name = (params.get('name') || 'anon').trim() || 'anon';
+
+    document.getElementById('meta').textContent = `Connected as: ${name}`;
+
+    const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${wsProto}://${window.location.host}/ws?name=${encodeURIComponent(name)}`);
+
+    const messages = document.getElementById('messages');
+    const form = document.getElementById('composer');
+    const input = document.getElementById('text');
+
+    function addSystem(text) {
+      const row = document.createElement('div');
+      row.className = 'row system';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+      row.appendChild(bubble);
+      messages.appendChild(row);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function addChatLine(sender, text) {
+      const row = document.createElement('div');
+      row.className = `row ${sender === name ? 'mine' : 'other'}`;
+
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+
+      const senderEl = document.createElement('span');
+      senderEl.className = 'sender';
+      senderEl.textContent = sender;
+
+      const msgEl = document.createElement('span');
+      msgEl.textContent = text;
+
+      bubble.appendChild(senderEl);
+      bubble.appendChild(msgEl);
+      row.appendChild(bubble);
+      messages.appendChild(row);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    ws.addEventListener('open', () => addSystem('Connected.'));
+    ws.addEventListener('close', () => addSystem('Disconnected from server.'));
+    ws.addEventListener('message', (event) => {
+      const raw = String(event.data || '');
+      const sep = raw.indexOf(': ');
+      if (sep > 0) {
+        const sender = raw.slice(0, sep);
+        const text = raw.slice(sep + 2);
+        addChatLine(sender, text);
+      } else {
+        addSystem(raw);
+      }
+    });
+
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const msg = input.value.trim();
+      if (!msg || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(msg);
+      input.value = '';
+      input.focus();
+    });
+  </script>
+</body>
+</html>
