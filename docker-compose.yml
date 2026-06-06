@@ -18,6 +18,11 @@ services:
     pids_limit: 128
     mem_limit: 128m
     cpus: "0.50"
+    ulimits:
+      nofile:
+        soft: 256
+        hard: 256
+    stop_grace_period: 5s
     logging:
       options:
         max-size: "10m"

@@ -80,3 +80,19 @@ Nginx robi publiczny routing:
 ```text
 https://msg-clone.marceldev-u.my -> http://127.0.0.1:8600
 ```
+
+## Ochrona przed przeciazeniem
+
+Konfiguracja produkcyjnego Nginx jest wersjonowana w `deploy/nginx/`.
+
+- HTTP: 5 requestow/s na IP, burst 15
+- WebSocket handshake: 6/min na IP, burst 3
+- WebSocket: maksymalnie 6 polaczen na IP i 120 lacznie
+- backend: maksymalnie 128 klientow
+- wiadomosci: 2/s na klienta, burst 5
+- wiadomosci globalnie: 40/s, burst 80
+- SQLite zachowuje maksymalnie okolo 10000 ostatnich wiadomosci
+- kontener ma limity CPU, RAM, PID i deskryptorow plikow
+
+Nadmiarowy ruch HTTP i nowe polaczenia dostaja `429`. Wolny lub niekompletny
+klient WebSocket nie blokuje pozostalych klientow.
