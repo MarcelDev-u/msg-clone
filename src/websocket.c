@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include <errno.h>
 #include <openssl/evp.h>
 
 #ifdef __APPLE__
@@ -13,19 +14,61 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+static const double CLIENT_MESSAGE_RATE = 2.0;
+static const double CLIENT_MESSAGE_BURST = 5.0;
+static const double GLOBAL_MESSAGE_RATE = 40.0;
+static const double GLOBAL_MESSAGE_BURST = 80.0;
+static double global_message_tokens = GLOBAL_MESSAGE_BURST;
+static double global_last_token_refill = 0.0;
 
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
     while (len) {
-        ssize_t n = send(fd, p, len, 0);
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n <= 0) return -1;
         p += n;
         len -= (size_t)n;
     }
     return 0;
+}
+
+static double monotonic_seconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+static void refill_tokens(double *tokens, double *last_refill, double rate, double burst, double now) {
+    if (*last_refill == 0.0) *last_refill = now;
+    *tokens += (now - *last_refill) * rate;
+    if (*tokens > burst) *tokens = burst;
+    *last_refill = now;
+}
+
+static int message_allowed(WsClient *client) {
+    double now = monotonic_seconds();
+    refill_tokens(
+        &client->message_tokens,
+        &client->last_token_refill,
+        CLIENT_MESSAGE_RATE,
+        CLIENT_MESSAGE_BURST,
+        now
+    );
+    refill_tokens(
+        &global_message_tokens,
+        &global_last_token_refill,
+        GLOBAL_MESSAGE_RATE,
+        GLOBAL_MESSAGE_BURST,
+        now
+    );
+    if (client->message_tokens < 1.0 || global_message_tokens < 1.0) return 0;
+    client->message_tokens -= 1.0;
+    global_message_tokens -= 1.0;
+    return 1;
 }
 
 static int websocket_accept_value(const char *key, char *out, size_t out_size) {
@@ -87,6 +130,9 @@ void ws_clients_init(WsClient *clients) {
     for (int i = 0; i < MAX_WS_CLIENTS; i++) {
         clients[i].fd = -1;
         clients[i].name[0] = '\0';
+        clients[i].input_len = 0;
+        clients[i].message_tokens = CLIENT_MESSAGE_BURST;
+        clients[i].last_token_refill = monotonic_seconds();
     }
 }
 
@@ -95,7 +141,10 @@ static int add_client(WsClient *clients, int fd, const char *name) {
         if (clients[i].fd < 0) {
             clients[i].fd = fd;
             snprintf(clients[i].name, sizeof(clients[i].name), "%s", name);
-            return 0;
+            clients[i].input_len = 0;
+            clients[i].message_tokens = CLIENT_MESSAGE_BURST;
+            clients[i].last_token_refill = monotonic_seconds();
+            return i;
         }
     }
     return -1;
@@ -106,6 +155,7 @@ void ws_remove_client(WsClient *clients, int idx) {
     close(clients[idx].fd);
     clients[idx].fd = -1;
     clients[idx].name[0] = '\0';
+    clients[idx].input_len = 0;
 }
 
 int ws_send_text(int fd, const char *text) {
@@ -133,41 +183,65 @@ static void broadcast(WsClient *clients, const char *text) {
     }
 }
 
-static int read_payload_len(int fd, unsigned char byte, unsigned long long *len) {
-    *len = byte & 0x7F;
-    if (*len == 126) {
-        unsigned char x[2];
-        if (recv(fd, x, 2, MSG_WAITALL) != 2) return -1;
-        *len = ((unsigned long long)x[0] << 8) | x[1];
-    } else if (*len == 127) return -1;
-    return 0;
+static int process_frame(WsClient *clients, int idx, size_t *consumed) {
+    WsClient *client = &clients[idx];
+    unsigned char *frame = client->input;
+    if (client->input_len < 2) return 0;
+    if ((frame[0] & 0x80) == 0 || (frame[1] & 0x80) == 0) return -1;
+
+    size_t header_len = 2;
+    unsigned long long payload_len = frame[1] & 0x7F;
+    if (payload_len == 126) {
+        if (client->input_len < 4) return 0;
+        payload_len = ((unsigned long long)frame[2] << 8) | frame[3];
+        header_len = 4;
+    } else if (payload_len == 127) {
+        return -1;
+    }
+    if (payload_len > MAX_WS_PAYLOAD) return -1;
+
+    size_t frame_len = header_len + 4 + (size_t)payload_len;
+    if (client->input_len < frame_len) return 0;
+
+    unsigned char opcode = frame[0] & 0x0F;
+    unsigned char *mask = frame + header_len;
+    unsigned char *payload = frame + header_len + 4;
+
+    if (opcode == 0x1 && payload_len > 0 && message_allowed(client)) {
+        char msg[MAX_WS_PAYLOAD + 1];
+        char line[MAX_NAME_LEN + 2 + MAX_WS_PAYLOAD + 1];
+        for (size_t i = 0; i < (size_t)payload_len; i++) {
+            msg[i] = (char)(payload[i] ^ mask[i % 4]);
+        }
+        msg[payload_len] = '\0';
+        if (chat_db_insert_message(client->name, msg) == 0) {
+            snprintf(line, sizeof(line), "%s: %s", client->name, msg);
+            broadcast(clients, line);
+        }
+    }
+    *consumed = frame_len;
+    return opcode == 0x8 ? -1 : 1;
 }
 
 int ws_handle_frame(WsClient *clients, int idx) {
-    unsigned char header[2], mask[4];
-    unsigned long long len = 0;
-    int fd = clients[idx].fd;
-    if (recv(fd, header, 2, MSG_WAITALL) != 2) return -1;
-    if ((header[1] & 0x80) == 0) return -1;
-    if (read_payload_len(fd, header[1], &len) < 0 || len > MAX_WS_PAYLOAD) return -1;
-    if (recv(fd, mask, 4, MSG_WAITALL) != 4) return -1;
-    char *msg = malloc((size_t)len + 1);
-    if (!msg) return -1;
-    if (recv(fd, msg, (size_t)len, MSG_WAITALL) != (ssize_t)len) {
-        free(msg);
-        return -1;
+    WsClient *client = &clients[idx];
+    size_t space = sizeof(client->input) - client->input_len;
+    if (space == 0) return -1;
+
+    ssize_t n = recv(client->fd, client->input + client->input_len, space, 0);
+    if (n == 0) return -1;
+    if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+    client->input_len += (size_t)n;
+
+    for (int frames = 0; frames < 8; frames++) {
+        size_t consumed = 0;
+        int rc = process_frame(clients, idx, &consumed);
+        if (rc < 0) return -1;
+        if (rc == 0) break;
+        client->input_len -= consumed;
+        memmove(client->input, client->input + consumed, client->input_len);
     }
-    for (unsigned long long i = 0; i < len; i++) msg[i] ^= mask[i % 4];
-    msg[len] = '\0';
-    unsigned char opcode = header[0] & 0x0F;
-    if (opcode == 0x1) {
-        char line[MAX_NAME_LEN + 2 + MAX_WS_PAYLOAD + 1];
-        chat_db_insert_message(clients[idx].name, msg);
-        snprintf(line, sizeof(line), "%s: %s", clients[idx].name, msg);
-        broadcast(clients, line);
-    }
-    free(msg);
-    return opcode == 0x8 ? -1 : 0;
+    return 0;
 }
 
 int ws_is_path(const char *path) {
@@ -178,6 +252,13 @@ int ws_upgrade(int fd, const char *request, const char *path, WsClient *clients)
     char name[MAX_NAME_LEN];
     get_name(path, name, sizeof(name));
     if (send_handshake(fd, request) < 0) return -1;
-    if (add_client(clients, fd, name) < 0) return -1;
-    return chat_db_send_recent_messages(fd, HISTORY_LIMIT);
+    int idx = add_client(clients, fd, name);
+    if (idx < 0) return -1;
+    if (chat_db_send_recent_messages(fd, HISTORY_LIMIT) < 0) {
+        clients[idx].fd = -1;
+        clients[idx].name[0] = '\0';
+        clients[idx].input_len = 0;
+        return -1;
+    }
+    return 0;
 }

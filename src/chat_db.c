@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 static sqlite3 *db = NULL;
+static unsigned int inserts_since_cleanup = 0;
 int chat_db_init(const char *path) {
     const char *sql =
         "CREATE TABLE IF NOT EXISTS messages ("
@@ -16,6 +17,7 @@ int chat_db_init(const char *path) {
         fprintf(stderr, "sqlite open failed: %s\n", sqlite3_errmsg(db));
         return -1;
     }
+    sqlite3_busy_timeout(db, 100);
     if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
         fprintf(stderr, "sqlite schema error: %s\n", err ? err : "unknown");
         sqlite3_free(err);
@@ -36,6 +38,21 @@ int chat_db_insert_message(const char *name, const char *message) {
     sqlite3_bind_text(stmt, 2, message, -1, SQLITE_TRANSIENT);
     int ok = sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
+    if (ok && ++inserts_since_cleanup >= 100) {
+        sqlite3_stmt *cleanup = NULL;
+        if (sqlite3_prepare_v2(
+                db,
+                "DELETE FROM messages WHERE id <= (SELECT MAX(id) - ? FROM messages);",
+                -1,
+                &cleanup,
+                NULL
+            ) == SQLITE_OK) {
+            sqlite3_bind_int(cleanup, 1, MAX_STORED_MESSAGES);
+            sqlite3_step(cleanup);
+        }
+        sqlite3_finalize(cleanup);
+        inserts_since_cleanup = 0;
+    }
     return ok ? 0 : -1;
 }
 

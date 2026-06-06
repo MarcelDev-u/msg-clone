@@ -1,6 +1,9 @@
 #include "app.h"
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,12 +15,17 @@
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
     while (len) {
-        ssize_t n = send(fd, p, len, 0);
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
         if (n <= 0) return -1;
         p += n;
         len -= (size_t)n;
     }
     return 0;
+}
+
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 ? 0 : -1;
 }
 
 static const char *route_file(const char *path) {
@@ -149,7 +157,7 @@ static void handle_new_client(int fd, WsClient *clients) {
         return;
     }
     if (ws_is_path(path) && ws_is_upgrade_request(request)) {
-        if (ws_upgrade(fd, request, path, clients) < 0) close(fd);
+        if (set_nonblocking(fd) < 0 || ws_upgrade(fd, request, path, clients) < 0) close(fd);
         return;
     }
     strip_query_string(path);
@@ -197,6 +205,7 @@ int main(void) {
     const char *db_path = getenv("CHAT_DB_PATH");
     if (!db_path) db_path = CHAT_DB_PATH;
     if (chat_db_init(db_path) < 0) return 1;
+    signal(SIGPIPE, SIG_IGN);
     ws_clients_init(clients);
     int server_fd = listen_on_localhost();
     if (server_fd < 0) return 1;

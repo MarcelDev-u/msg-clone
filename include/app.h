@@ -7,10 +7,16 @@
 #define MAX_WS_CLIENTS 128
 #define MAX_NAME_LEN 64
 #define MAX_WS_PAYLOAD 4096
+#define MAX_WS_FRAME_SIZE (MAX_WS_PAYLOAD + 8)
 #define HISTORY_LIMIT 50
+#define MAX_STORED_MESSAGES 10000
 typedef struct {
     int fd;
     char name[MAX_NAME_LEN];
+    unsigned char input[MAX_WS_FRAME_SIZE];
+    size_t input_len;
+    double message_tokens;
+    double last_token_refill;
 } WsClient;
 int chat_db_init(const char *path);
 void chat_db_close(void);
